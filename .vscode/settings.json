@@ -1,0 +1,6 @@
+{
+    "sonarlint.connectedMode.project": {
+        "connectionId": "123",
+        "projectKey": "codeSharks_:master"
+    }
+}
