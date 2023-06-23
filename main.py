@@ -1,7 +1,7 @@
 # 导入所需的模块
+import asyncio
 import contextlib
 import threading
-import time
 
 import psutil
 import win32api
@@ -19,7 +19,7 @@ timer = None  # 定时器对象
 
 
 # 定义一些辅助函数
-def create_icebox():
+async def create_icebox():
     # 创建一个名为 icebox 的虚拟桌面，并返回它的编号
     global icebox, icebox_id
     icebox = VirtualDesktop.create()
@@ -28,7 +28,7 @@ def create_icebox():
     return icebox_id
 
 
-def get_hwnds_by_pid(pid):
+async def get_hwnds_by_pid(pid):
     hwnds = []
 
     def callback(hwnd, hwnds):
@@ -42,7 +42,7 @@ def get_hwnds_by_pid(pid):
     return hwnds
 
 
-def get_window_info_by_hwnd(hwnd):
+async def get_window_info_by_hwnd(hwnd):
     """
     Given an HWND, returns the process ID, window title, and virtual desktop ID (if available).
 
@@ -58,11 +58,11 @@ def get_window_info_by_hwnd(hwnd):
     return pid, title, vdid
 
 
-def get_forewindow():
+async def get_forewindow():
     return win32gui.GetForegroundWindow()
 
 
-def get_all_windows():
+async def get_all_windows():
     """
     Returns a dictionary containing all the windows that are currently open in the system.
     The keys are the window handles (hwnd) and the values are the process IDs (pid).
@@ -77,7 +77,7 @@ def get_all_windows():
 
     def callback(hwnd, hwnds):
         if win32gui.IsWindowVisible(hwnd) and win32gui.GetWindowText(hwnd):
-            hwnds[hwnd] = get_window_info_by_hwnd(hwnd)
+            hwnds[hwnd] = asyncio.ensure_future(get_window_info_by_hwnd(hwnd))
         return True
 
     hwnds = {}
@@ -85,10 +85,12 @@ def get_all_windows():
     return hwnds
 
 
-def suspend_process(pid):
+async def suspend_process(pid):
     # 挂起一个进程，并返回它的状态
     process = psutil.Process(pid)
-    forepid = get_window_info_by_hwnd(get_forewindow())[0]
+    forehwnd = await get_forewindow()
+    foreinfo = await get_window_info_by_hwnd(forehwnd)
+    forepid = foreinfo[0]
     if pid not in suspended_windows.values() or pid == forepid:  # 如果是当前活动窗口，则不冻结
         print(f"{pid}是当前活动窗口，不可挂起")
         if process.status() == "stopped":
@@ -102,7 +104,7 @@ def suspend_process(pid):
     return process.status()
 
 
-def resume_process(pid):
+async def resume_process(pid):
     # 恢复一个进程，并返回它的状态
     process = psutil.Process(pid)
     print(f"准备恢复进程{pid}")
@@ -132,16 +134,13 @@ def timer_callback(hwnd, msg, idEvent, time):
     run_func_in_new_thread(process_scan)
 
 
-def global_timer_callback(hwnd, msg, idEvent, time):
-    # 定期扫描所有进程并挂起或恢复对应的进程
-    run_func_in_new_thread(process_scan)
 
 
-def hook_callback(event=None):
+async def hook_callback(event=None):
     # 在钩子事件发生时执行的函数
     global suspended_windows, timer
-    run_func_in_new_thread(check_forewindow)
-    run_func_in_new_thread(process_scan)
+    await check_forewindow()
+    await process_scan()
     # event_type = wParam # 事件类型，如鼠标左键按下、释放等
     # event_data = lParam # 事件数据，如鼠标坐标、键盘扫描码等
 
@@ -149,35 +148,39 @@ def hook_callback(event=None):
     return 0
 
 
-# 主程序开始
-
-# 创建 icebox 虚拟桌面，并获取它的编号
-icebox_id = create_icebox()
 
 
-def process_scan():
+async def process_scan():
+    """
+    Process all running processes and get their window handles and process IDs.
+    Suspend the processes and add them to a dictionary if their window is in icebox.
+    Resume the processes and remove them from the dictionary if their window is not in icebox
+    and the process has stopped.
+    """
     # 遍历所有正在运行的进程，并获取它们的窗口句柄和进程 ID
-    for hwnd, proc_info in get_all_windows().items():
+    all_windows = await get_all_windows()
+    for hwnd, proc_info in all_windows.items():
         with contextlib.suppress(
             psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess
         ):
-            pid, title, desktop_id = proc_info
+            pid, title, desktop_id = await proc_info
             if hwnd != 0:
                 if desktop_id == icebox_id:
                     # print(f"Process {pid} has window handle {hwnd} with title {title} in virtual desktop {desktop_id,icebox_id}")
                     # 如果窗口在 icebox 内，挂起进程，并将其添加到字典中
                     suspended_windows[hwnd] = pid
-                    suspend_process(pid)
+                    await suspend_process(pid)
                 elif hwnd in suspended_windows:
                     # 如果在字典中，则恢复进程，并将其从字典中删除
-                    resume_process(pid)
+                    await resume_process(pid)
                     suspended_windows.pop(hwnd)
     for proc in psutil.process_iter():
         if proc.status() == "stopped" and proc.pid not in suspended_windows.values():
-            hwnds = get_hwnds_by_pid(proc.pid)
+            hwnds = await get_hwnds_by_pid(proc.pid)
             if hwnds != [] and all(hwnd not in suspended_windows for hwnd in hwnds):
                 for hwnd in hwnds:
-                    if get_window_info_by_hwnd(hwnd)[2] == icebox_id:
+                    proc_info = await get_window_info_by_hwnd(hwnd)
+                    if proc_info[2] == icebox_id:
                         suspended_windows[hwnd] = pid
 
 
@@ -186,32 +189,46 @@ def run_func_in_new_thread(target):
     threading.Thread(target=target).start()
 
 
-def check_forewindow():
+async def check_forewindow():
     # 获取当前活动的窗口句柄，并检查它是否在字典中
-    foreground_window = win32gui.GetForegroundWindow()
+    foreground_window = await get_forewindow()
     if foreground_window in suspended_windows:
         # 如果是，恢复对应的进程，并启动一个定时器
         pid = suspended_windows[foreground_window]
-        resume_process(pid)
+        await resume_process(pid)
         start_timer()
 
 
-run_func_in_new_thread(process_scan)
+# run_func_in_new_thread(process_scan)
 old_forewindow_handle = None
 
+# 主程序开始
 
-def main_loop():
-    global old_forewindow_handle
+
+
+async def main_loop():
+    """
+    The function continuously checks for changes in the foreground window and calls a hook callback
+    function if there is a change or if the window is suspended.
+    """
+    # 创建 icebox 虚拟桌面，并获取它的编号
+    await create_icebox()
+    await process_scan()
     while True:
-        time.sleep(0.3)
-        foreground_window = win32gui.GetForegroundWindow()
-        if (
-            foreground_window != old_forewindow_handle
-            or foreground_window in suspended_windows
-        ):
-            old_forewindow_handle = foreground_window
-            # print(foreground_window,get_window_info_by_hwnd(foreground_window))
-            hook_callback()
+        await asyncio.sleep(0.5)
+        await check_once()
+
+async def check_once():
+    global old_forewindow_handle
+    # time.sleep(0.3)
+    foreground_window = await get_forewindow()
+    if (
+        foreground_window != old_forewindow_handle
+        or foreground_window in suspended_windows
+    ):
+        old_forewindow_handle = foreground_window
+        # print(foreground_window,await get_window_info_by_hwnd(foreground_window))
+        await hook_callback()
 
 
-main_loop()
+asyncio.run(main_loop())
