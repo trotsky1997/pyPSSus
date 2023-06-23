@@ -158,30 +158,39 @@ async def process_scan():
     and the process has stopped.
     """
     # 遍历所有正在运行的进程，并获取它们的窗口句柄和进程 ID
+    async def for_worker_1(hwnd, proc_info):
+        pid, title, desktop_id = await proc_info
+        if hwnd != 0:
+            if desktop_id == icebox_id:
+                # print(f"Process {pid} has window handle {hwnd} with title {title} in virtual desktop {desktop_id,icebox_id}")
+                # 如果窗口在 icebox 内，挂起进程，并将其添加到字典中
+                suspended_windows[hwnd] = pid
+                await suspend_process(pid)
+            elif hwnd in suspended_windows:
+                # 如果在字典中，则恢复进程，并将其从字典中删除
+                await resume_process(pid)
+                suspended_windows.pop(hwnd)
     all_windows = await get_all_windows()
-    for hwnd, proc_info in all_windows.items():
-        with contextlib.suppress(
-            psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess
-        ):
-            pid, title, desktop_id = await proc_info
-            if hwnd != 0:
-                if desktop_id == icebox_id:
-                    # print(f"Process {pid} has window handle {hwnd} with title {title} in virtual desktop {desktop_id,icebox_id}")
-                    # 如果窗口在 icebox 内，挂起进程，并将其添加到字典中
-                    suspended_windows[hwnd] = pid
-                    await suspend_process(pid)
-                elif hwnd in suspended_windows:
-                    # 如果在字典中，则恢复进程，并将其从字典中删除
-                    await resume_process(pid)
-                    suspended_windows.pop(hwnd)
-    for proc in psutil.process_iter():
+    with contextlib.suppress(psutil.NoSuchProcess, psutil.AccessDenied, psutil.ZombieProcess):
+        futures1 = [ for_worker_1(hwnd, proc_info) for hwnd, proc_info in all_windows.items()]
+
+    async def for_worker_3(hwnd,pid):
+        proc_info = await get_window_info_by_hwnd(hwnd)
+        if proc_info[2] == icebox_id:
+            suspended_windows[hwnd] = pid
+
+    async def for_worker_2(proc):
         if proc.status() == "stopped" and proc.pid not in suspended_windows.values():
             hwnds = await get_hwnds_by_pid(proc.pid)
             if hwnds != [] and all(hwnd not in suspended_windows for hwnd in hwnds):
-                for hwnd in hwnds:
-                    proc_info = await get_window_info_by_hwnd(hwnd)
-                    if proc_info[2] == icebox_id:
-                        suspended_windows[hwnd] = pid
+                await asyncio.gather(*[for_worker_3(hwnd,proc.pid) for hwnd in hwnds])
+
+
+    futures2 = [for_worker_2(proc) for proc in psutil.process_iter()]
+    await asyncio.gather(*futures1)
+    await asyncio.gather(*futures2)
+
+
 
 
 def run_func_in_new_thread(target):
